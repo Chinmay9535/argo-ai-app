@@ -16,4 +16,5 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 # THE FIX: Use the correct --bind argument for Gunicorn and add a long timeout
-CMD ["gunicorn", "--bind", "0.0.0.0:8080", "--timeout", "600", "app:app"]
+
+CMD ["gunicorn", "--bind", "0.0.0.0:8080", "--timeout", "1800", "app:app"]
