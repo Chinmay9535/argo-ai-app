@@ -2,34 +2,41 @@ import os
 import pandas as pd
 import xarray as xr
 import xxhash
-import time
 from flask import Flask, request, jsonify
 from flask_cors import CORS
+
+# LangChain Imports for vector database functionality
 from langchain_community.vectorstores import Chroma
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain.docstore.document import Document
-from langchain.chains import RetrievalQA
-from langchain_cohere import ChatCohere
 
 # --- Configuration ---
-DATA_DIR = os.environ.get('WEBAPP_STORAGE_HOME', '/data')
+# This path is for Azure's persistent file storage
+DATA_DIR = os.environ.get('WEBAPP_STORAGE_HOME', '/data') 
 NC_FILES_PATH = os.path.join(DATA_DIR, "nc_files")
 PERSIST_DIRECTORY = os.path.join(DATA_DIR, "argo_vectordb")
-COHERE_API_KEY = os.environ.get('COHERE_API_KEY')
+PORT = int(os.environ.get('PORT', 8080))
 
-# --- Initialization ---
+# Ensure the directories exist
+os.makedirs(NC_FILES_PATH, exist_ok=True)
+os.makedirs(PERSIST_DIRECTORY, exist_ok=True)
+
+# --- Initialize Flask App & Load Models ---
 app = Flask(__name__)
 CORS(app)
 
-print("WEB: Loading models and vector store...")
+print("DATA PIPELINE: Loading embedding model...")
 embedding_model = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+print("DATA PIPELINE: Loading vector store...")
 vector_store = Chroma(persist_directory=PERSIST_DIRECTORY, embedding_function=embedding_model)
-retriever = vector_store.as_retriever()
-llm = ChatCohere(model="command-r", cohere_api_key=COHERE_API_KEY)
-qa_chain = RetrievalQA.from_chain_type(llm=llm, chain_type="stuff", retriever=retriever)
-print("WEB: All models loaded successfully.")
+print("DATA PIPELINE: Models and vector store loaded successfully.")
+
 
 def process_and_add_files():
+    """
+    Scans the upload folder for .nc files, converts them to documents,
+    deduplicates them, adds them to the vector store, and cleans up.
+    """
     print("Starting file processing...")
     try:
         existing_ids = set(vector_store.get(include=["metadatas"])['ids'])
@@ -66,17 +73,16 @@ def process_and_add_files():
                     doc_id = xxhash.xxh64(doc_text).hexdigest()
                     new_documents.append(Document(page_content=doc_text, metadata={"unique_id": doc_id}))
                 except Exception as e:
-                    # This will catch ANY error with a specific row and skip it
                     print(f"    - WARNING: Skipping a row in {filename} due to a data formatting issue: {e}")
                     continue
-            processed_files.append(filepath) # Mark file as processed
+            processed_files.append(filepath) 
         except Exception as e:
-            # This will catch ANY error with an entire file and skip it
             print(f"  - ERROR: Could not process file {filename}, skipping it. Reason: {e}")
             continue
 
+    # Deduplicate and add to the vector store
     if not new_documents:
-        # Clean up files that were processed but resulted in no new docs (e.g., all duplicates)
+        # Clean up files that were processed but were all duplicates
         for fp in processed_files:
             try:
                 os.remove(fp)
@@ -103,14 +109,18 @@ def process_and_add_files():
             
     return num_added
 
+
 # --- API Endpoints ---
 @app.route("/")
 def hello():
-    return "Argo AI Backend with Cohere LLM is live!"
+    return "Argo AI Data Pipeline is live and running on Azure!"
 
 @app.route('/upload', methods=['POST'])
 def upload_files():
     files = request.files.getlist('files')
+    if not files:
+        return jsonify({"error": "No files selected for uploading."}), 400
+
     for file in files:
         if file and file.filename.endswith('.nc'):
             file.save(os.path.join(NC_FILES_PATH, file.filename))
@@ -124,10 +134,25 @@ def upload_files():
 
 @app.route('/ask', methods=['POST'])
 def ask_question():
+    """
+    Performs a raw similarity search and returns the most relevant document.
+    Useful for testing the contents of the vector database.
+    """
     data = request.get_json()
     question = data.get('question', '')
+    if not question:
+        return jsonify({"error": "No question provided."}), 400
+    
     try:
-        result = qa_chain.invoke({"query": question})
-        return jsonify({"answer": result.get("result", "Could not generate an answer.")})
+        # Use the retriever directly to find the most similar raw document
+        docs = vector_store.similarity_search(query=question, k=1)
+        if docs:
+            answer = docs[0].page_content
+        else:
+            answer = "Database is empty or no relevant documents were found."
+        return jsonify({"answer": answer})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=PORT)
