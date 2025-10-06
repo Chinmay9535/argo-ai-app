@@ -2,6 +2,7 @@ import os
 import pandas as pd
 import xarray as xr
 import xxhash
+import time
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from langchain_community.vectorstores import Chroma
@@ -36,19 +37,17 @@ def process_and_add_files():
         existing_ids = set()
 
     new_documents = []
+    processed_files = []
     files_in_dir = [f for f in os.listdir(NC_FILES_PATH) if f.endswith('.nc')]
 
     for filename in files_in_dir:
         filepath = os.path.join(NC_FILES_PATH, filename)
-        
-        # --- ROBUSTNESS FIX 1: Handle corrupted or unreadable files ---
         try:
             ds = xr.open_dataset(filepath, decode_times=True)
             df = ds.to_dataframe().reset_index()
             df.dropna(subset=['PRES_ADJUSTED', 'TEMP_ADJUSTED', 'PSAL_ADJUSTED'], inplace=True)
 
             for _, row in df.iterrows():
-                # --- ROBUSTNESS FIX 2: Handle malformed rows ---
                 try:
                     timestamp = row['JULD']
                     platform_number = int(row['PLATFORM_NUMBER'].decode('utf-8').strip())
@@ -66,15 +65,23 @@ def process_and_add_files():
                     )
                     doc_id = xxhash.xxh64(doc_text).hexdigest()
                     new_documents.append(Document(page_content=doc_text, metadata={"unique_id": doc_id}))
-                except (KeyError, AttributeError, ValueError) as e:
+                except Exception as e:
+                    # This will catch ANY error with a specific row and skip it
                     print(f"    - WARNING: Skipping a row in {filename} due to a data formatting issue: {e}")
-                    continue # Skip to the next row
+                    continue
+            processed_files.append(filepath) # Mark file as processed
         except Exception as e:
+            # This will catch ANY error with an entire file and skip it
             print(f"  - ERROR: Could not process file {filename}, skipping it. Reason: {e}")
-            continue # Skip to the next file
+            continue
 
-    # Deduplicate and add to the vector store
     if not new_documents:
+        # Clean up files that were processed but resulted in no new docs (e.g., all duplicates)
+        for fp in processed_files:
+            try:
+                os.remove(fp)
+            except OSError as e:
+                print(f"Error removing processed duplicate file {fp}: {e}")
         return 0
 
     unique_new_docs_map = {doc.metadata["unique_id"]: doc for doc in new_documents}
@@ -83,15 +90,18 @@ def process_and_add_files():
     if docs_to_add:
         ids_to_add = [doc.metadata["unique_id"] for doc in docs_to_add]
         vector_store.add_documents(documents=docs_to_add, ids=ids_to_add)
-        # Clean up processed files
-        for filename in files_in_dir:
-            os.remove(os.path.join(NC_FILES_PATH, filename))
-        return len(docs_to_add)
+        num_added = len(docs_to_add)
     else:
-        # Clean up processed files even if they are duplicates
-        for filename in files_in_dir:
-            os.remove(os.path.join(NC_FILES_PATH, filename))
-        return 0
+        num_added = 0
+
+    # Clean up all successfully processed files
+    for fp in processed_files:
+        try:
+            os.remove(fp)
+        except OSError as e:
+            print(f"Error removing processed file {fp}: {e}")
+            
+    return num_added
 
 # --- API Endpoints ---
 @app.route("/")
@@ -105,13 +115,17 @@ def upload_files():
         if file and file.filename.endswith('.nc'):
             file.save(os.path.join(NC_FILES_PATH, file.filename))
     
-    num_added = process_and_add_files()
-    return jsonify({"message": f"Files uploaded. Added {num_added} new records. Check logs for any skipped files."})
+    try:
+        num_added = process_and_add_files()
+        return jsonify({"message": f"Files uploaded. Added {num_added} new records. Check logs for any skipped files."})
+    except Exception as e:
+        print(f"CRITICAL ERROR during file processing: {e}")
+        return jsonify({"error": "A critical error occurred on the server during processing."}), 500
 
 @app.route('/ask', methods=['POST'])
 def ask_question():
     data = request.get_json()
-    question = data['question']
+    question = data.get('question', '')
     try:
         result = qa_chain.invoke({"query": question})
         return jsonify({"answer": result.get("result", "Could not generate an answer.")})
