@@ -9,4 +9,5 @@ chromadb
 sentence-transformers
 xxhash
 gunicorn
+langchain-cohere
 torch
