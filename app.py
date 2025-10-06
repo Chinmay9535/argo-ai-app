@@ -1,127 +1,119 @@
-# app.py
-
 import os
 import pandas as pd
 import xarray as xr
 import xxhash
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-from langchain.vectorstores import Chroma
+from langchain_community.vectorstores import Chroma
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain.docstore.document import Document
-# from langchain.chains import RetrievalQA
-# from langchain_community.llms import Ollama # Placeholder for a real LLM
+from langchain.chains import RetrievalQA
+from langchain_cohere import ChatCohere
 
 # --- Configuration ---
 DATA_DIR = os.environ.get('WEBAPP_STORAGE_HOME', '/data')
 NC_FILES_PATH = os.path.join(DATA_DIR, "nc_files")
 PERSIST_DIRECTORY = os.path.join(DATA_DIR, "argo_vectordb")
-PORT = int(os.environ.get('PORT', 8080))
+COHERE_API_KEY = os.environ.get('COHERE_API_KEY')
 
-os.makedirs(NC_FILES_PATH, exist_ok=True)
-os.makedirs(PERSIST_DIRECTORY, exist_ok=True)
-
-# --- Initialize Flask App & Load Models ---
+# --- Initialization ---
 app = Flask(__name__)
 CORS(app)
 
-print("Loading embedding model...")
+print("WEB: Loading models and vector store...")
 embedding_model = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
-print("Loading vector store...")
 vector_store = Chroma(persist_directory=PERSIST_DIRECTORY, embedding_function=embedding_model)
 retriever = vector_store.as_retriever()
-print("Models and vector store loaded successfully.")
+llm = ChatCohere(model="command-r", cohere_api_key=COHERE_API_KEY)
+qa_chain = RetrievalQA.from_chain_type(llm=llm, chain_type="stuff", retriever=retriever)
+print("WEB: All models loaded successfully.")
 
-
-# --- Processing Function (Your existing automation logic) ---
 def process_and_add_files():
     print("Starting file processing...")
-    # Load existing IDs from the database
     try:
         existing_ids = set(vector_store.get(include=["metadatas"])['ids'])
-        print(f"Found {len(existing_ids)} existing documents.")
-    except Exception as e:
-        print(f"Could not get existing IDs, starting fresh. Error: {e}")
+    except Exception:
         existing_ids = set()
 
     new_documents = []
-    # Loop through uploaded files
-    for filename in os.listdir(NC_FILES_PATH):
-        if filename.endswith(".nc"):
-            filepath = os.path.join(NC_FILES_PATH, filename)
-            # (Insert your robust file processing logic here from the final Colab script)
-            # This is a simplified version for demonstration
-            try:
-                ds = xr.open_dataset(filepath, decode_times=True)
-                df = ds.to_dataframe().reset_index()
-                df.dropna(subset=['PRES_ADJUSTED', 'TEMP_ADJUSTED', 'PSAL_ADJUSTED'], inplace=True)
-                
-                for _, row in df.iterrows():
+    files_in_dir = [f for f in os.listdir(NC_FILES_PATH) if f.endswith('.nc')]
+
+    for filename in files_in_dir:
+        filepath = os.path.join(NC_FILES_PATH, filename)
+        
+        # --- ROBUSTNESS FIX 1: Handle corrupted or unreadable files ---
+        try:
+            ds = xr.open_dataset(filepath, decode_times=True)
+            df = ds.to_dataframe().reset_index()
+            df.dropna(subset=['PRES_ADJUSTED', 'TEMP_ADJUSTED', 'PSAL_ADJUSTED'], inplace=True)
+
+            for _, row in df.iterrows():
+                # --- ROBUSTNESS FIX 2: Handle malformed rows ---
+                try:
+                    timestamp = row['JULD']
+                    platform_number = int(row['PLATFORM_NUMBER'].decode('utf-8').strip())
+                    cycle_number = int(row['CYCLE_NUMBER'])
+                    pressure = row['PRES_ADJUSTED']
+                    temperature = row['TEMP_ADJUSTED']
+                    salinity = row['PSAL_ADJUSTED']
+                    latitude = row['LATITUDE']
+                    longitude = row['LONGITUDE']
+
                     doc_text = (
-                        f"On {row['JULD'].strftime('%Y-%m-%d %H:%M:%S')}, "
-                        f"the Argo float with platform number {int(row['PLATFORM_NUMBER'].decode('utf-8').strip())} "
-                        f"recorded a temperature of {row['TEMP_ADJUSTED']:.2f} C and salinity of {row['PSAL_ADJUSTED']:.3f} PSU."
+                        f"On {timestamp.strftime('%Y-%m-%d %H:%M:%S')}, the Argo float with platform number {platform_number} "
+                        f"(cycle {cycle_number}) recorded a temperature of {temperature:.2f} C and salinity of {salinity:.3f} PSU "
+                        f"at a pressure of {pressure:.1f} dbar. The measurement was taken at latitude {latitude:.3f} and longitude {longitude:.3f}."
                     )
                     doc_id = xxhash.xxh64(doc_text).hexdigest()
                     new_documents.append(Document(page_content=doc_text, metadata={"unique_id": doc_id}))
-            except Exception as e:
-                print(f"Skipping file {filename} due to error: {e}")
-                continue
-    
+                except (KeyError, AttributeError, ValueError) as e:
+                    print(f"    - WARNING: Skipping a row in {filename} due to a data formatting issue: {e}")
+                    continue # Skip to the next row
+        except Exception as e:
+            print(f"  - ERROR: Could not process file {filename}, skipping it. Reason: {e}")
+            continue # Skip to the next file
+
     # Deduplicate and add to the vector store
     if not new_documents:
-        print("No new documents found to process.")
         return 0
 
     unique_new_docs_map = {doc.metadata["unique_id"]: doc for doc in new_documents}
     docs_to_add = [doc for doc in unique_new_docs_map.values() if doc.metadata["unique_id"] not in existing_ids]
 
     if docs_to_add:
-        print(f"Adding {len(docs_to_add)} new unique documents to the vector store.")
         ids_to_add = [doc.metadata["unique_id"] for doc in docs_to_add]
         vector_store.add_documents(documents=docs_to_add, ids=ids_to_add)
+        # Clean up processed files
+        for filename in files_in_dir:
+            os.remove(os.path.join(NC_FILES_PATH, filename))
         return len(docs_to_add)
     else:
-        print("No new unique documents to add.")
+        # Clean up processed files even if they are duplicates
+        for filename in files_in_dir:
+            os.remove(os.path.join(NC_FILES_PATH, filename))
         return 0
-
 
 # --- API Endpoints ---
 @app.route("/")
 def hello():
-    return "Argo AI Backend is live and running on Azure!"
+    return "Argo AI Backend with Cohere LLM is live!"
 
 @app.route('/upload', methods=['POST'])
 def upload_files():
-    if 'files' not in request.files:
-        return jsonify({"error": "No files part in the request."}), 400
-    
     files = request.files.getlist('files')
-    if not files:
-        return jsonify({"error": "No files selected for uploading."}), 400
-
     for file in files:
         if file and file.filename.endswith('.nc'):
             file.save(os.path.join(NC_FILES_PATH, file.filename))
     
-    # After saving, trigger the processing function
     num_added = process_and_add_files()
-    
-    return jsonify({"message": f"Files uploaded successfully. Added {num_added} new records to the database."})
-
+    return jsonify({"message": f"Files uploaded. Added {num_added} new records. Check logs for any skipped files."})
 
 @app.route('/ask', methods=['POST'])
 def ask_question():
-    # ... (this endpoint remains the same)
     data = request.get_json()
     question = data['question']
-    docs = retriever.get_relevant_documents(question)
-    if docs:
-        answer = docs[0].page_content
-    else:
-        answer = "Database is empty or no relevant data found. Please upload .nc files first."
-    return jsonify({"answer": answer})
-
-
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=PORT)
+    try:
+        result = qa_chain.invoke({"query": question})
+        return jsonify({"answer": result.get("result", "Could not generate an answer.")})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
