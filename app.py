@@ -52,14 +52,14 @@ def process_and_add_files():
                     timestamp = row['JULD']
                     platform_number = int(row['PLATFORM_NUMBER'].decode('utf-8').strip())
                     cycle_number = int(row['CYCLE_NUMBER'])
-                    # --- ADDED THE DETAILED VARIABLES HERE ---
+                    # --- Defining the detailed parameters ---
                     pressure = row['PRES_ADJUSTED']
                     temperature = row['TEMP_ADJUSTED']
                     salinity = row['PSAL_ADJUSTED']
                     latitude = row['LATITUDE']
                     longitude = row['LONGITUDE']
 
-                    # --- UPDATED doc_text TO INCLUDE ALL DETAILS ---
+                    # --- THE FIX: Creating the detailed document text ---
                     doc_text = (
                         f"On {timestamp.strftime('%Y-%m-%d %H:%M:%S')}, the Argo float with platform number {platform_number} "
                         f"(cycle {cycle_number}) recorded a temperature of {temperature:.2f} C and salinity of {salinity:.3f} PSU "
